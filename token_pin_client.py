@@ -32,11 +32,13 @@ if os.path.isdir(AUDIT_DIR):
             find_rubix_databases,
             build_ipfs_path_mapping,
             extract_node_name,
+            find_node_ipfs_binary,
         )
     except Exception:
         find_rubix_databases = None  # type: ignore
         build_ipfs_path_mapping = None  # type: ignore
         extract_node_name = None  # type: ignore
+        find_node_ipfs_binary = None  # type: ignore
 else:
     find_rubix_databases = None  # type: ignore
     build_ipfs_path_mapping = None  # type: ignore
@@ -338,11 +340,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Build per-database IPFS_PATH mapping
         ipfs_mapping = build_ipfs_path_mapping(databases)  # type: ignore
 
+        # Build per-database IPFS binary mapping
+        ipfs_binary_mapping = {}
+        if find_node_ipfs_binary:
+            for db_path, _ in databases:
+                ipfs_binary = find_node_ipfs_binary(db_path)  # type: ignore
+                ipfs_binary_mapping[db_path] = ipfs_binary
+        else:
+            # Fallback: use global ipfs command for all nodes
+            for db_path, _ in databases:
+                ipfs_binary_mapping[db_path] = args.ipfs_command
+
         # Print summary of all discovered nodes and their IPFS paths
-        print("\n📋 Discovered Nodes and IPFS Paths:")
+        print("\n📋 Discovered Nodes and IPFS Configuration:")
         print("=" * 80)
         for idx, (db_path, _last_mod) in enumerate(databases, start=1):
             node_ipfs_path = ipfs_mapping.get(db_path)
+            node_ipfs_binary = ipfs_binary_mapping.get(db_path, args.ipfs_command)
             if extract_node_name:
                 node_name = extract_node_name(db_path)  # type: ignore
             else:
@@ -353,6 +367,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"   IPFS_PATH: {node_ipfs_path}")
             else:
                 print(f"   IPFS_PATH: ⚠️  NOT FOUND (will use environment IPFS_PATH)")
+            if node_ipfs_binary:
+                print(f"   IPFS binary: {node_ipfs_binary}")
+            else:
+                print(f"   IPFS binary: ⚠️  NOT FOUND (will use: {args.ipfs_command})")
         print("=" * 80)
         print()
 
@@ -362,6 +380,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         for idx, (db_path, _last_mod) in enumerate(databases, start=1):
             node_ipfs_path = ipfs_mapping.get(db_path)
+            node_ipfs_binary = ipfs_binary_mapping.get(db_path, args.ipfs_command)
             # Extract node name if extract_node_name is available
             if extract_node_name:
                 node_name = extract_node_name(db_path)  # type: ignore
@@ -379,6 +398,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "  IPFS_PATH    : WARNING - No .ipfs directory found for this node; "
                     "will use existing IPFS_PATH environment."
                 )
+            if node_ipfs_binary:
+                print(f"  IPFS binary  : {node_ipfs_binary}")
+            else:
+                print(f"  IPFS binary  : {args.ipfs_command} (fallback)")
 
             if not os.path.exists(db_path):
                 print(f"  Skipping: DB not found on disk anymore: {db_path}")
@@ -420,7 +443,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         status_col=status_col,
                         api_url=args.api_url,
                         cids=batch_cids,
-                        ipfs_command=args.ipfs_command,
+                        ipfs_command=node_ipfs_binary,
                         ipfs_path=node_ipfs_path,
                     )
                     total_not_found += nf

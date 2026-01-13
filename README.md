@@ -56,13 +56,43 @@ pip3 install -r requirements.txt
 Automatically finds all Rubix nodes and processes each with its own IPFS repository:
 
 ```bash
+# Example: If nodes are in /home/user/wallets/
+python3 token_pin_client.py --auto-discover --search-root /home/user/wallets
+
+# Or if running from repo and nodes are in parent directory
 python3 token_pin_client.py --auto-discover --search-root ..
 ```
 
 This mode:
 - Scans for all `Rubix/rubix.db` files starting from `--search-root`
-- Automatically detects each node's `.ipfs` directory
-- Processes each node's pending tokens with the correct `IPFS_PATH`
+- Automatically detects each node's `.ipfs` directory and `ipfs` binary
+- Processes each node's pending tokens with the correct `IPFS_PATH` and IPFS binary
+
+**Example Structure:**
+```
+/home/user/
+├── github/
+│   └── TokenPinClient/     # Repo location
+└── wallets/
+    ├── node002/
+    │   └── node002/
+    │       ├── Rubix/
+    │       │   └── rubix.db  # Database
+    │       ├── .ipfs/        # IPFS repository (auto-detected)
+    │       └── ipfs          # IPFS binary (auto-detected)
+    └── node003/
+        └── node003/
+            ├── Rubix/
+            │   └── rubix.db
+            ├── .ipfs/
+            └── ipfs
+```
+
+With this structure, run:
+```bash
+cd /home/user/github/TokenPinClient
+python3 token_pin_client.py --auto-discover --search-root /home/user/wallets
+```
 
 #### Single Database Mode
 
@@ -134,13 +164,22 @@ python3 token_pin_client.py \
 - `2302` (NOT_FOUND_STATUS): Tokens not found in the API (updated automatically)
 - Other statuses: Remain unchanged (found tokens are pinned but status is preserved)
 
-### IPFS Path Detection
+### IPFS Path and Binary Detection
 
 In auto-discovery mode, the client:
 1. Finds all `Rubix/rubix.db` files
-2. For each database, walks up the directory tree to find the corresponding `.ipfs` directory
-3. Validates the `.ipfs` directory (checks for `config`, `datastore`, etc.)
-4. Uses that `IPFS_PATH` when pinning tokens for that node
+2. For each database:
+   - **IPFS Directory**: Walks up the directory tree to find the corresponding `.ipfs` directory
+   - **IPFS Binary**: Walks up the directory tree to find the `ipfs` executable (typically in the same directory as `.ipfs`)
+   - Validates both (checks `.ipfs` for `config`, `datastore`, etc., and tests `ipfs` binary)
+3. Uses each node's own `IPFS_PATH` and `ipfs` binary when pinning tokens
+
+**Path Resolution Example:**
+- Database: `/home/user/wallets/node002/node002/Rubix/rubix.db`
+- Detected `.ipfs`: `/home/user/wallets/node002/node002/.ipfs`
+- Detected `ipfs` binary: `/home/user/wallets/node002/node002/ipfs`
+
+The client automatically uses these per-node paths, ensuring each node's tokens are pinned to the correct IPFS repository.
 
 ## 📁 Project Structure
 
