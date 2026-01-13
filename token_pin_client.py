@@ -316,6 +316,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # AUTO-DISCOVER MODE: scan all Rubix/rubix.db and handle each node automatically
     if args.auto_discover:
+        # Use global variables to avoid UnboundLocalError
+        global find_rubix_databases, build_ipfs_path_mapping, extract_node_name, find_node_ipfs_binary
+        
         if find_rubix_databases is None or build_ipfs_path_mapping is None:
             print("ERROR: --auto-discover requires the audit tools to be available.")
             print("")
@@ -368,15 +371,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 shutil.rmtree(AUDIT_DIR)
                             shutil.move(temp_dir, AUDIT_DIR)
                             
-                            # Re-import
+                            # Re-import (using global to update module-level variables)
                             sys.path.insert(0, AUDIT_DIR)
                             try:
                                 from sync_distributed_tokens import (  # type: ignore
-                                    find_rubix_databases,
-                                    build_ipfs_path_mapping,
-                                    extract_node_name,
-                                    find_node_ipfs_binary,
+                                    find_rubix_databases as _find_rubix_databases,
+                                    build_ipfs_path_mapping as _build_ipfs_path_mapping,
+                                    extract_node_name as _extract_node_name,
+                                    find_node_ipfs_binary as _find_node_ipfs_binary,
                                 )
+                                # Update global variables
+                                find_rubix_databases = _find_rubix_databases
+                                build_ipfs_path_mapping = _build_ipfs_path_mapping
+                                extract_node_name = _extract_node_name
+                                find_node_ipfs_binary = _find_node_ipfs_binary
                                 print("✓ Audit tools downloaded and imported successfully!")
                                 print("Auto-discovery mode is now enabled.")
                                 print("")
