@@ -1,0 +1,6 @@
+# Token Pin Client - Python Dependencies
+# Install with: pip3 install -r requirements.txt
+
+# HTTP requests for API calls
+requests>=2.28.0
+
