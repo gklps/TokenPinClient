@@ -25,6 +25,7 @@ import requests
 
 # Try to import helpers from the audit tools if available (for auto-discovery)
 AUDIT_DIR = os.path.join(os.path.dirname(__file__), "audit")
+AUDIT_IMPORT_ERROR = None
 if os.path.isdir(AUDIT_DIR):
     sys.path.insert(0, AUDIT_DIR)
     try:
@@ -34,7 +35,8 @@ if os.path.isdir(AUDIT_DIR):
             extract_node_name,
             find_node_ipfs_binary,
         )
-    except Exception:
+    except Exception as e:
+        AUDIT_IMPORT_ERROR = str(e)
         find_rubix_databases = None  # type: ignore
         build_ipfs_path_mapping = None  # type: ignore
         extract_node_name = None  # type: ignore
@@ -315,11 +317,114 @@ def main(argv: Optional[List[str]] = None) -> int:
     # AUTO-DISCOVER MODE: scan all Rubix/rubix.db and handle each node automatically
     if args.auto_discover:
         if find_rubix_databases is None or build_ipfs_path_mapping is None:
-            print(
-                "ERROR: --auto-discover requires the audit tools (sync_distributed_tokens) "
-                "to be available in the 'audit' folder."
-            )
-            return 1
+            print("ERROR: --auto-discover requires the audit tools to be available.")
+            print("")
+            if not os.path.isdir(AUDIT_DIR):
+                print(f"The 'audit' folder was not found at: {AUDIT_DIR}")
+                print("")
+                print("Would you like to automatically download the audit-tools repository?")
+                print("This will enable auto-discovery mode.")
+                print("")
+                try:
+                    response = input("Download audit-tools? (y/n) [y]: ").strip().lower()
+                    if not response:
+                        response = "y"
+                except (KeyboardInterrupt, EOFError):
+                    print("\nCancelled.")
+                    return 1
+                
+                if response in ["y", "yes"]:
+                    print("")
+                    print("Downloading audit-tools repository...")
+                    import subprocess
+                    import tempfile
+                    import shutil
+                    
+                    AUDIT_REPO_URL = "https://github.com/gklps/audit-tools.git"
+                    temp_dir = tempfile.mkdtemp()
+                    
+                    try:
+                        # Check if git is available
+                        result = subprocess.run(
+                            ["git", "--version"],
+                            capture_output=True,
+                            timeout=5
+                        )
+                        if result.returncode != 0:
+                            raise FileNotFoundError("git not found")
+                        
+                        # Clone the repository
+                        print(f"Cloning {AUDIT_REPO_URL}...")
+                        result = subprocess.run(
+                            ["git", "clone", AUDIT_REPO_URL, temp_dir],
+                            capture_output=True,
+                            text=True,
+                            timeout=60
+                        )
+                        
+                        if result.returncode == 0:
+                            # Move to audit folder
+                            if os.path.exists(AUDIT_DIR):
+                                shutil.rmtree(AUDIT_DIR)
+                            shutil.move(temp_dir, AUDIT_DIR)
+                            
+                            # Re-import
+                            sys.path.insert(0, AUDIT_DIR)
+                            try:
+                                from sync_distributed_tokens import (  # type: ignore
+                                    find_rubix_databases,
+                                    build_ipfs_path_mapping,
+                                    extract_node_name,
+                                    find_node_ipfs_binary,
+                                )
+                                print("✓ Audit tools downloaded and imported successfully!")
+                                print("Auto-discovery mode is now enabled.")
+                                print("")
+                            except Exception as e:
+                                print(f"ERROR: Downloaded but import failed: {e}")
+                                print("Please check the audit folder manually.")
+                                return 1
+                        else:
+                            print(f"ERROR: Failed to clone repository: {result.stderr}")
+                            print(f"Repository: {AUDIT_REPO_URL}")
+                            return 1
+                    except FileNotFoundError:
+                        print("ERROR: git is not installed.")
+                        print("Please install git first, or manually download the audit folder.")
+                        print(f"Repository: {AUDIT_REPO_URL}")
+                        return 1
+                    except subprocess.TimeoutExpired:
+                        print("ERROR: Download timed out. Please check your internet connection.")
+                        return 1
+                    except Exception as e:
+                        print(f"ERROR: Failed to download: {e}")
+                        return 1
+                    finally:
+                        # Clean up temp directory if it still exists
+                        if os.path.exists(temp_dir):
+                            shutil.rmtree(temp_dir)
+                else:
+                    print("")
+                    print("Skipping download. To enable auto-discovery later:")
+                    print(f"  git clone {AUDIT_REPO_URL} {AUDIT_DIR}")
+                    print("")
+                    print("Alternative: Use single-database mode with --db-path instead.")
+                    return 1
+            elif AUDIT_IMPORT_ERROR:
+                print(f"The 'audit' folder exists but import failed: {AUDIT_IMPORT_ERROR}")
+                print("")
+                print("Please ensure:")
+                print("1. The audit folder contains 'sync_distributed_tokens.py'")
+                print("2. All dependencies for the audit tools are installed")
+                print("3. The file is not corrupted")
+                print("")
+                print("Alternative: Use single-database mode with --db-path instead.")
+                return 1
+            else:
+                print("The audit tools could not be imported for an unknown reason.")
+                print("")
+                print("Alternative: Use single-database mode with --db-path instead.")
+                return 1
 
         print("==============================================")
         print(" Token Pin Client - AUTO DISCOVER MODE")

@@ -43,6 +43,25 @@ The setup script will:
 - Check for IPFS binary
 - Set up script permissions
 
+**Important for Auto-Discovery Mode:**
+If you want to use `--auto-discover` mode, you need to add the `audit` folder locally:
+- The `audit` folder contains reference tools for node discovery
+- It's ignored by git (`.gitignore`) as it's a reference implementation
+- Get the audit folder from: [https://github.com/gklps/audit-tools/](https://github.com/gklps/audit-tools/)
+- Clone or copy the `audit-tools` repository and copy the entire repo contents into `TokenPinClient/audit/`
+- The folder should contain `sync_distributed_tokens.py` with the helper functions
+
+**Quick setup for auto-discovery:**
+```bash
+# Clone the audit-tools repo
+git clone https://github.com/gklps/audit-tools.git /tmp/audit-tools
+
+# Copy it into TokenPinClient as 'audit' folder
+cp -r /tmp/audit-tools /home/cherryrubix/github/TokenPinClient/audit
+```
+
+If you don't have the audit folder, you can still use single-database mode with `--db-path`.
+
 ### 2. Install Dependencies Manually (if needed)
 
 ```bash
@@ -266,9 +285,10 @@ python3 token_pin_client.py --ipfs-path /path/to/.ipfs ...
 
 ### Auto-Discovery Not Working
 
-- Ensure the `audit` folder exists (contains reference tools)
+- Ensure the `audit` folder exists (get it from [audit-tools repo](https://github.com/gklps/audit-tools/))
 - Check that `Rubix/rubix.db` files exist in the search path
 - Verify directory structure: `.../NodeName/Rubix/rubix.db`
+- Verify `audit/sync_distributed_tokens.py` exists and is importable
 
 ### Database Connection Issues
 
@@ -280,7 +300,7 @@ python3 token_pin_client.py --ipfs-path /path/to/.ipfs ...
 
 - **Status Updates**: Only `not_found` tokens get status updated to `2302`. Found tokens are pinned but their status remains unchanged.
 - **IPFS Pinning**: The client uses `ipfs add` with the content from the API response. The CID returned by IPFS must match the token's CID for successful pinning.
-- **Audit Folder**: The `audit/` folder is ignored by git (reference only). It contains helper functions for auto-discovery. If missing, only single-database mode is available.
+- **Audit Folder**: The `audit/` folder is ignored by git (reference only). Get it from [https://github.com/gklps/audit-tools/](https://github.com/gklps/audit-tools/). It contains helper functions for auto-discovery. If missing, only single-database mode is available.
 
 ## 🤝 Contributing
 
@@ -296,7 +316,10 @@ python3 token_pin_client.py --ipfs-path /path/to/.ipfs ...
 
 ## 🔗 Related Projects
 
-- **Audit Tools**: Reference implementation in `audit/` folder (not part of this repo)
+- **Audit Tools**: Reference implementation for node discovery
+  - Repository: [https://github.com/gklps/audit-tools/](https://github.com/gklps/audit-tools/)
+  - Required for `--auto-discover` mode
+  - Copy the entire audit-tools repo into `TokenPinClient/audit/` to enable auto-discovery
 
 ---
 
