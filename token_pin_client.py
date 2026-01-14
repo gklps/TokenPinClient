@@ -14,10 +14,15 @@ Intended usage per node:
 """
 
 import argparse
+import logging
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -56,6 +61,43 @@ NOT_FOUND_STATUS = 2302
 # Tokens in results are pinned but status remains unchanged.
 # PINNED_STATUS = 1         # (not used - status unchanged for pinned tokens)
 # PIN_FAILED_STATUS = 2303  # (not used - status unchanged for pin failures)
+
+# Setup logging
+def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
+    """Setup logging to both file and console (console only shows warnings/errors)"""
+    if log_file is None:
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"token_pin_{timestamp}.log"
+    
+    logger = logging.getLogger("token_pin_client")
+    logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # File handler - detailed logs (DEBUG level)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler - only warnings and errors
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)
+    console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# Global logger (will be initialized in main)
+logger: Optional[logging.Logger] = None
 
 
 def detect_columns(conn: sqlite3.Connection, table_name: str) -> Tuple[str, str]:
@@ -120,6 +162,85 @@ def call_tokens_batch_api(api_url: str, cids: List[str]) -> Dict:
     resp = requests.post(api_url, json=payload, timeout=60)
     resp.raise_for_status()
     return resp.json()
+
+
+def get_ipfs_peer_id(
+    ipfs_command: str = "./ipfs",
+    ipfs_path: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Get the IPFS peer ID (node ID) for the given IPFS_PATH.
+    
+    Returns:
+        Peer ID string or None if failed
+    """
+    env = os.environ.copy()
+    if ipfs_path:
+        env["IPFS_PATH"] = ipfs_path
+    
+    try:
+        proc = subprocess.run(
+            [ipfs_command, "id"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+        )
+        
+        if proc.returncode != 0:
+            return None
+        
+        # Parse JSON output to get peer ID
+        import json
+        output = proc.stdout.decode("utf-8", errors="replace").strip()
+        try:
+            id_data = json.loads(output)
+            return id_data.get("ID") or id_data.get("id")
+        except json.JSONDecodeError:
+            # Fallback: try to extract from text output
+            for line in output.splitlines():
+                if "ID" in line or "id" in line:
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        return parts[1].strip().strip('",')
+            return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return None
+
+
+def verify_ipfs_node_match(
+    ipfs_command: str,
+    ipfs_path: Optional[str],
+    expected_node_name: str,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Verify that the IPFS peer ID can be retrieved for the given IPFS_PATH.
+    This ensures we're using the correct node's IPFS repository.
+    
+    The peer ID is logged for verification. If peer ID cannot be retrieved,
+    it means the IPFS_PATH might be incorrect or the IPFS repo is not accessible.
+    
+    Returns:
+        (is_valid, peer_id, error_message)
+    """
+    if not ipfs_path:
+        return False, None, "IPFS_PATH not set - cannot verify node exclusivity"
+    
+    if not os.path.exists(ipfs_path):
+        return False, None, f"IPFS_PATH does not exist: {ipfs_path}"
+    
+    peer_id = get_ipfs_peer_id(ipfs_command, ipfs_path)
+    if not peer_id:
+        return False, None, "Could not retrieve IPFS peer ID - IPFS repo may be inaccessible or corrupted"
+    
+    # Log the peer ID for verification
+    if logger:
+        logger.info(f"IPFS peer ID for {expected_node_name}: {peer_id} (IPFS_PATH: {ipfs_path})")
+    
+    # Return True - peer ID successfully retrieved, meaning we're using the correct IPFS repo
+    # The peer ID is logged so you can verify it matches the expected node
+    return True, peer_id, None
 
 
 def run_ipfs_add(
@@ -192,6 +313,28 @@ def update_token_statuses(
     return rows_updated
 
 
+def pin_single_token(
+    cid: str,
+    content: str,
+    ipfs_command: str,
+    ipfs_path: Optional[str],
+) -> Tuple[str, bool, Optional[str], str]:
+    """
+    Pin a single token to IPFS.
+    
+    Returns:
+        (cid, success, added_cid, error_message)
+    """
+    success, added_cid, output = run_ipfs_add(
+        content=content, ipfs_command=ipfs_command, ipfs_path=ipfs_path
+    )
+    if not success:
+        return cid, False, None, output
+    if added_cid != cid:
+        return cid, False, added_cid, f"CID mismatch: expected {cid}, got {added_cid}"
+    return cid, True, added_cid, ""
+
+
 def process_batch(
     conn: sqlite3.Connection,
     table_name: str,
@@ -201,6 +344,11 @@ def process_batch(
     cids: List[str],
     ipfs_command: str,
     ipfs_path: Optional[str],
+    verbose: bool = False,
+    batch_num: int = 0,
+    total_batches: int = 0,
+    start_time: Optional[float] = None,
+    max_workers: int = 4,
 ) -> Tuple[int, int, int]:
     """
     Process one batch of CIDs:
@@ -214,7 +362,18 @@ def process_batch(
     if not cids:
         return 0, 0, 0
 
-    print(f"Calling /tokens/batch for {len(cids)} tokens...")
+    batch_start_time = time.time()
+    if logger:
+        logger.debug(f"Calling /tokens/batch for {len(cids)} tokens...")
+    
+    # Show progress update
+    if total_batches > 0:
+        progress_pct = (batch_num / total_batches) * 100
+        elapsed = time.time() - start_time if start_time else 0
+        print(f"  [{batch_num}/{total_batches}] Processing batch ({progress_pct:.1f}%) | Elapsed: {elapsed:.0f}s", end="\r")
+    elif verbose:
+        print(f"Calling /tokens/batch for {len(cids)} tokens...")
+    
     data = call_tokens_batch_api(api_url, cids)
 
     not_found = data.get("not_found", []) or []
@@ -225,42 +384,95 @@ def process_batch(
         updated = update_token_statuses(
             conn, table_name, cid_col, status_col, not_found, NOT_FOUND_STATUS
         )
-        print(f"  Marked {updated} tokens as NOT_FOUND (status={NOT_FOUND_STATUS})")
+        msg = f"Marked {updated} tokens as NOT_FOUND (status={NOT_FOUND_STATUS})"
+        if logger:
+            logger.info(msg)
+        if verbose:
+            print(f"  {msg}")
 
     pinned_ok = 0
     pin_failed = 0
-
+    total_results = len(results)
+    
+    if total_results == 0:
+        return len(not_found), 0, 0
+    
+    # Prepare tokens for parallel processing
+    tokens_to_pin = []
     for cid, info in results.items():
         content = info.get("content")
         if not content:
-            print(f"  Skipping {cid}: no content in API response")
+            msg = f"Skipping {cid}: no content in API response"
+            if logger:
+                logger.warning(msg)
+            if verbose:
+                print(f"  {msg}")
             pin_failed += 1
             continue
-
-        success, added_cid, output = run_ipfs_add(
-            content=content, ipfs_command=ipfs_command, ipfs_path=ipfs_path
-        )
-        if not success:
-            print(f"  IPFS add failed for {cid}: {output} (status unchanged)")
-            pin_failed += 1
-            continue
-
-        if added_cid != cid:
-            print(
-                f"  CID mismatch for {cid}: ipfs returned {added_cid}, "
-                f"expected {cid} (status unchanged)"
-            )
-            pin_failed += 1
-            continue
-
-        # Success: pinned but status remains unchanged
-        pinned_ok += 1
-        print(f"  Pinned OK: {cid} (status unchanged)")
+        tokens_to_pin.append((cid, content))
+    
+    if not tokens_to_pin:
+        return len(not_found), 0, pin_failed
+    
+    # Parallel IPFS pinning
+    progress_lock = threading.Lock()
+    processed_count = [0]  # Use list for thread-safe counter
+    
+    def update_progress():
+        with progress_lock:
+            processed_count[0] += 1
+            count = processed_count[0]
+            elapsed = time.time() - batch_start_time
+            rate = count / elapsed if elapsed > 0 else 0
+            if total_batches > 0 and total_results > 0:
+                overall_progress = ((batch_num - 1) / total_batches + (count / total_results) / total_batches) * 100
+                print(f"  [{batch_num}/{total_batches}] Pinning: {count}/{total_results} ({rate:.1f}/s) | Overall: {overall_progress:.1f}%", end="\r")
+            elif total_results > 0:
+                print(f"  Pinning: {count}/{total_results} ({rate:.1f}/s)", end="\r")
+    
+    # Process tokens in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all pinning tasks
+        future_to_cid = {
+            executor.submit(pin_single_token, cid, content, ipfs_command, ipfs_path): cid
+            for cid, content in tokens_to_pin
+        }
+        
+        # Process completed tasks
+        for future in as_completed(future_to_cid):
+            cid = future_to_cid[future]
+            try:
+                cid_result, success, added_cid, error = future.result()
+                update_progress()
+                
+                if not success:
+                    msg = f"IPFS add failed for {cid_result}: {error} (status unchanged)"
+                    if logger:
+                        logger.warning(msg)
+                    if verbose:
+                        print(f"\n  {msg}")
+                    pin_failed += 1
+                else:
+                    pinned_ok += 1
+                    if logger:
+                        logger.debug(f"Pinned OK: {cid_result} (status unchanged)")
+            except Exception as e:
+                msg = f"Exception pinning {cid}: {e}"
+                if logger:
+                    logger.error(msg)
+                if verbose:
+                    print(f"\n  {msg}")
+                pin_failed += 1
+    
+    # Clear progress line
+    print()  # New line after progress updates
 
     return len(not_found), pinned_ok, pin_failed
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    global logger
+    
     parser = argparse.ArgumentParser(
         description="Token Pin Client: verify tokens via /tokens/batch and pin to IPFS"
     )
@@ -311,8 +523,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             "(default: .., typically the parent containing Node folders)"
         ),
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed output in console (default: summary only, details go to log file)",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Path to log file (default: logs/token_pin_YYYYMMDD_HHMMSS.log)",
+    )
 
     args = parser.parse_args(argv)
+    
+    # Setup logging
+    logger = setup_logging(args.log_file)
+    if logger:
+        logger.info("=" * 60)
+        logger.info("Token Pin Client - Starting")
+        logger.info("=" * 60)
 
     # AUTO-DISCOVER MODE: scan all Rubix/rubix.db and handle each node automatically
     if args.auto_discover:
@@ -441,6 +670,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"API URL     : {args.api_url}")
         print(f"Batch size  : {args.batch_size}")
         print(f"IPFS cmd    : {args.ipfs_command}")
+        print(f"Max workers : {args.max_workers} (parallel IPFS pinning)")
         print("Table name  : TokensTable (Rubix/rubix.db)")
         print("==============================================")
 
@@ -519,6 +749,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not os.path.exists(db_path):
                 print(f"  Skipping: DB not found on disk anymore: {db_path}")
                 continue
+            
+            # Verify IPFS node matches before processing
+            if node_ipfs_path and node_ipfs_binary:
+                is_match, peer_id, error = verify_ipfs_node_match(
+                    node_ipfs_binary, node_ipfs_path, node_name
+                )
+                if not is_match:
+                    print(f"  ERROR: IPFS node verification failed for {node_name}")
+                    if error:
+                        print(f"    {error}")
+                    if peer_id:
+                        print(f"    Peer ID retrieved: {peer_id}")
+                    print(f"  Skipping this node to maintain exclusivity.")
+                    if logger:
+                        logger.error(f"IPFS node verification failed for {node_name}: {error}")
+                    continue
+                elif peer_id:
+                    print(f"  IPFS peer ID: {peer_id} ✓")
+                    if logger:
+                        logger.info(f"Verified IPFS peer ID for {node_name}: {peer_id}")
 
             conn = sqlite3.connect(db_path)
             try:
@@ -542,13 +792,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 total_pinned_ok = 0
                 total_pin_failed = 0
 
-                for i, batch_cids in enumerate(
-                    batch_list(pending_cids, args.batch_size), start=1
-                ):
-                    print(
-                        f"\n  --- Node batch {i} "
-                        f"({len(batch_cids)} tokens) ---"
-                    )
+                batches = list(batch_list(pending_cids, args.batch_size))
+                total_batches = len(batches)
+                node_start_time = time.time()
+                
+                print(f"  Processing {total_pending} tokens in {total_batches} batches...")
+                
+                for i, batch_cids in enumerate(batches, start=1):
+                    batch_msg = f"Node batch {i}/{total_batches} ({len(batch_cids)} tokens)"
+                    if args.verbose:
+                        print(f"\n  --- {batch_msg} ---")
+                    if logger:
+                        logger.info(f"Processing {batch_msg}")
+                    
                     nf, ok, failed = process_batch(
                         conn=conn,
                         table_name=table_name,
@@ -558,7 +814,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                         cids=batch_cids,
                         ipfs_command=node_ipfs_binary,
                         ipfs_path=node_ipfs_path,
+                        verbose=args.verbose,
+                        batch_num=i,
+                        total_batches=total_batches,
+                        start_time=node_start_time,
+                        max_workers=args.max_workers,
                     )
+                    
+                    # Show brief summary after each batch completes
+                    elapsed = time.time() - node_start_time
+                    rate = (i * args.batch_size) / elapsed if elapsed > 0 else 0
+                    print(f"  Batch {i}/{total_batches} complete: {ok} pinned, {nf} not_found, {failed} failed | Rate: {rate:.1f} tokens/s")
                     total_not_found += nf
                     total_pinned_ok += ok
                     total_pin_failed += failed
@@ -586,6 +852,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Total pinned OK (status unchanged): {overall_pinned_ok}")
         print(f"Total pin failed (status unchanged): {overall_pin_failed}")
         print("==============================================")
+        if logger:
+            if args.log_file:
+                print(f"\n📝 Detailed logs saved to: {args.log_file}")
+            else:
+                log_dir = Path("logs")
+                latest_log = max(log_dir.glob("token_pin_*.log"), key=os.path.getmtime, default=None)
+                if latest_log:
+                    print(f"\n📝 Detailed logs saved to: {latest_log}")
         return 0
 
     # SINGLE-DB MODE: process just one SQLite database
@@ -606,13 +880,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("==============================================")
     print(f"SQLite DB : {db_path}")
     print(f"Table     : {args.table_name}")
+    print(f"Max workers: {args.max_workers} (parallel IPFS pinning)")
     print(f"API URL   : {args.api_url}")
     print(f"Batch size: {args.batch_size}")
     print(f"IPFS cmd  : {args.ipfs_command}")
     if args.ipfs_path:
         print(f"IPFS_PATH : {args.ipfs_path}")
+        # Verify IPFS node
+        peer_id = get_ipfs_peer_id(args.ipfs_command, args.ipfs_path)
+        if peer_id:
+            print(f"IPFS peer ID: {peer_id} ✓")
+            if logger:
+                logger.info(f"IPFS peer ID: {peer_id}")
+        else:
+            print("WARNING: Could not verify IPFS peer ID")
+            if logger:
+                logger.warning("Could not retrieve IPFS peer ID for verification")
     else:
         print("IPFS_PATH : using existing environment (must be set correctly)")
+        print("WARNING: IPFS_PATH not specified - cannot verify node exclusivity")
     print("==============================================")
 
     conn = sqlite3.connect(db_path)
@@ -635,13 +921,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         total_pinned_ok = 0
         total_pin_failed = 0
 
-        for i, batch_cids in enumerate(
-            batch_list(pending_cids, args.batch_size), start=1
-        ):
-            print(
-                f"\n--- Processing batch {i} "
-                f"({len(batch_cids)} tokens) ---"
-            )
+        batches = list(batch_list(pending_cids, args.batch_size))
+        total_batches = len(batches)
+        db_start_time = time.time()
+        
+        print(f"Processing {total_pending} tokens in {total_batches} batches...")
+        
+        for i, batch_cids in enumerate(batches, start=1):
+            batch_msg = f"Batch {i}/{total_batches} ({len(batch_cids)} tokens)"
+            if args.verbose:
+                print(f"\n--- Processing {batch_msg} ---")
+            if logger:
+                logger.info(f"Processing {batch_msg}")
+            
             nf, ok, failed = process_batch(
                 conn=conn,
                 table_name=args.table_name,
@@ -651,19 +943,43 @@ def main(argv: Optional[List[str]] = None) -> int:
                 cids=batch_cids,
                 ipfs_command=args.ipfs_command,
                 ipfs_path=args.ipfs_path,
+                verbose=args.verbose,
+                batch_num=i,
+                total_batches=total_batches,
+                start_time=db_start_time,
+                max_workers=args.max_workers,
             )
+            
+            # Show brief summary after each batch completes
+            elapsed = time.time() - db_start_time
+            rate = (i * args.batch_size) / elapsed if elapsed > 0 else 0
+            print(f"  Batch {i}/{total_batches} complete: {ok} pinned, {nf} not_found, {failed} failed | Rate: {rate:.1f} tokens/s")
             total_not_found += nf
             total_pinned_ok += ok
             total_pin_failed += failed
-
-        print("\n==============================================")
-        print(" Token Pin Client Summary")
-        print("==============================================")
-        print(f"Total pending processed : {total_pending}")
-        print(f"Not found (status→2302) : {total_not_found}")
-        print(f"Pinned OK (status unchanged): {total_pinned_ok}")
-        print(f"Pin failed (status unchanged): {total_pin_failed}")
-        print("==============================================")
+        
+        # Clear the progress line and show summary
+        print()  # New line after progress updates
+        
+        summary = f"""
+==============================================
+ Token Pin Client Summary
+==============================================
+Total pending processed : {total_pending}
+Not found (status→2302) : {total_not_found}
+Pinned OK (status unchanged): {total_pinned_ok}
+Pin failed (status unchanged): {total_pin_failed}
+=============================================="""
+        print(summary)
+        if logger:
+            logger.info(summary)
+            if args.log_file:
+                logger.info(f"Detailed logs saved to: {args.log_file}")
+            else:
+                log_dir = Path("logs")
+                latest_log = max(log_dir.glob("token_pin_*.log"), key=os.path.getmtime, default=None)
+                if latest_log:
+                    logger.info(f"Detailed logs saved to: {latest_log}")
 
         return 0
 

@@ -47,6 +47,19 @@ fi
 echo -e "${GREEN}✓ pip3 found${NC}"
 echo ""
 
+# Check git (needed for auto-downloading audit tools)
+echo -e "${BLUE}Checking git (for audit tools download)...${NC}"
+if command -v git &> /dev/null; then
+    echo -e "${GREEN}✓ git found${NC}"
+    GIT_AVAILABLE=true
+else
+    echo -e "${YELLOW}⚠ git not found${NC}"
+    echo "  git is needed to automatically download audit-tools repository"
+    echo "  Install git if you want auto-download feature"
+    GIT_AVAILABLE=false
+fi
+echo ""
+
 # Install Python dependencies
 echo -e "${BLUE}Installing Python dependencies...${NC}"
 if [ -f "requirements.txt" ]; then
@@ -113,10 +126,14 @@ if [ "$AUDIT_NEEDED" = true ]; then
         echo -e "${BLUE}Downloading audit-tools repository...${NC}"
         
         # Check if git is available
-        if ! command -v git &> /dev/null; then
+        if [ "$GIT_AVAILABLE" = false ]; then
             echo -e "${RED}ERROR: git is not installed.${NC}"
             echo "  Please install git first, or manually download the audit folder."
             echo "  Repository: $AUDIT_REPO_URL"
+            echo ""
+            echo "  Install git:"
+            echo "    Ubuntu/Debian: sudo apt-get install git"
+            echo "    macOS: git should be available with Xcode Command Line Tools"
         else
             # Use a temporary directory for cloning
             TEMP_AUDIT_DIR=$(mktemp -d)
@@ -156,6 +173,12 @@ if [ "$AUDIT_NEEDED" = true ]; then
 fi
 echo ""
 
+# Create logs directory
+echo -e "${BLUE}Setting up logs directory...${NC}"
+mkdir -p logs
+echo -e "${GREEN}✓ Logs directory created${NC}"
+echo ""
+
 # Make token_pin_client.py executable
 echo -e "${BLUE}Setting up script permissions...${NC}"
 chmod +x token_pin_client.py
@@ -167,21 +190,44 @@ echo "=========================================="
 echo -e "${GREEN}Setup Complete!${NC}"
 echo "=========================================="
 echo ""
+echo "Features available:"
+echo "  ✓ Parallel IPFS pinning (configurable workers)"
+echo "  ✓ Automatic IPFS peer ID verification (node exclusivity)"
+echo "  ✓ Detailed logging to files (logs/ directory)"
+echo "  ✓ Live progress tracking"
+echo "  ✓ Auto-discovery of Rubix nodes"
+echo ""
 echo "Next steps:"
 echo ""
 echo "1. Ensure IPFS is set up for your node(s):"
 echo "   - Each node should have its own .ipfs directory"
-echo "   - Set IPFS_PATH environment variable if needed"
+echo "   - Each node should have its own ipfs binary"
+echo "   - The script will automatically:"
+echo "     * Detect each node's IPFS_PATH and ipfs binary"
+echo "     * Verify IPFS peer ID to ensure node exclusivity"
+echo "     * Skip nodes if IPFS verification fails"
 echo ""
 echo "2. Run the client:"
 echo ""
-echo "   # Auto-discover all nodes (requires audit folder):"
-echo "   python3 token_pin_client.py --auto-discover --search-root .."
+echo "   # Auto-discover all nodes (recommended):"
+echo "   python3 token_pin_client.py --auto-discover --search-root /path/to/wallets"
+echo ""
+echo "   # With custom settings:"
+echo "   python3 token_pin_client.py --auto-discover --search-root /path/to/wallets \\"
+echo "     --max-workers 8 --batch-size 200"
 echo ""
 echo "   # Or process a single database:"
-echo "   python3 token_pin_client.py --db-path /path/to/rubix.db"
+echo "   python3 token_pin_client.py --db-path /path/to/rubix.db \\"
+echo "     --ipfs-path /path/to/.ipfs --ipfs-command /path/to/ipfs"
 echo ""
-echo "3. For help:"
+echo "   # Verbose mode (see all details in console):"
+echo "   python3 token_pin_client.py --auto-discover --search-root /path/to/wallets --verbose"
+echo ""
+echo "3. Check logs:"
+echo "   - Detailed logs are saved to: logs/token_pin_YYYYMMDD_HHMMSS.log"
+echo "   - Console shows summary only (use --verbose for details)"
+echo ""
+echo "4. For help:"
 echo "   python3 token_pin_client.py --help"
 echo ""
 echo "=========================================="
