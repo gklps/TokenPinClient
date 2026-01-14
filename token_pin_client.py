@@ -533,6 +533,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="Path to log file (default: logs/token_pin_YYYYMMDD_HHMMSS.log)",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Maximum number of parallel IPFS pinning workers (default: 4, use 1 to disable parallelization)",
+    )
 
     args = parser.parse_args(argv)
     
