@@ -23,6 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -533,14 +534,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="Path to log file (default: logs/token_pin_YYYYMMDD_HHMMSS.log)",
     )
+    # Calculate optimal default workers based on CPU count
+    # For I/O-bound tasks like IPFS, we can use more workers than CPU cores
+    optimal_workers = max(1, cpu_count() * 2)  # 2x CPU cores for I/O-bound operations
+    
     parser.add_argument(
         "--max-workers",
-        type=int,
-        default=4,
-        help="Maximum number of parallel IPFS pinning workers (default: 4, use 1 to disable parallelization)",
+        type=str,
+        default=str(optimal_workers),
+        help=f"Maximum number of parallel IPFS pinning workers (default: {optimal_workers} auto-calculated from CPU count, use 'auto' for system-optimal, use 1 to disable parallelization)",
     )
 
     args = parser.parse_args(argv)
+    
+    # Parse max_workers - handle 'auto' or numeric string
+    if args.max_workers.lower() == 'auto':
+        args.max_workers = optimal_workers
+        print(f"Using auto-detected optimal workers: {optimal_workers} (CPU count: {cpu_count()})")
+    else:
+        try:
+            args.max_workers = int(args.max_workers)
+            if args.max_workers < 1:
+                print(f"WARNING: max-workers must be >= 1, using 1 instead")
+                args.max_workers = 1
+        except ValueError:
+            print(f"ERROR: Invalid max-workers value: {args.max_workers}. Use a number or 'auto'")
+            return 1
     
     # Setup logging
     logger = setup_logging(args.log_file)
