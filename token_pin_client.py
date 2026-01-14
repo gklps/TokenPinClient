@@ -16,9 +16,11 @@ Intended usage per node:
 import argparse
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -292,6 +294,126 @@ def run_ipfs_add(
     return True, cid, out
 
 
+def run_ipfs_bulk_add(
+    tokens: List[Tuple[str, str]],  # List of (cid, content) tuples
+    ipfs_command: str = "./ipfs",
+    ipfs_path: Optional[str] = None,
+) -> Dict[str, Tuple[bool, Optional[str], str]]:
+    """
+    Bulk add multiple tokens to IPFS using a single `ipfs add` command.
+    Creates temporary files and adds them all at once, then parses results.
+    
+    This is much more efficient than individual `ipfs add` calls and avoids
+    lock contention issues.
+    
+    Args:
+        tokens: List of (cid, content) tuples to add
+        ipfs_command: Path to ipfs executable
+        ipfs_path: IPFS_PATH for the node's repo
+        
+    Returns:
+        Dictionary mapping CID -> (success, added_cid, error_message)
+    """
+    if not tokens:
+        return {}
+    
+    results = {}
+    temp_dir = None
+    
+    try:
+        # Create temporary directory for token files
+        temp_dir = tempfile.mkdtemp(prefix="ipfs_bulk_add_")
+        
+        # Write each token's content to a file named by its CID
+        file_paths = []
+        for cid, content in tokens:
+            file_path = os.path.join(temp_dir, cid)
+            try:
+                with open(file_path, 'wb') as f:
+                    f.write(content.encode('utf-8'))
+                file_paths.append(file_path)
+            except Exception as e:
+                # If we can't write a file, mark it as failed
+                results[cid] = (False, None, f"Failed to create temp file: {e}")
+        
+        if not file_paths:
+            return results
+        
+        # Run single `ipfs add` command on all files
+        env = os.environ.copy()
+        if ipfs_path:
+            env["IPFS_PATH"] = ipfs_path
+        
+        try:
+            # Use -Q (quiet) to get only CIDs, or parse full output
+            proc = subprocess.run(
+                [ipfs_command, "add"] + file_paths,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=300,  # 5 minute timeout for bulk operations
+            )
+        except FileNotFoundError as e:
+            for cid, _ in tokens:
+                if cid not in results:
+                    results[cid] = (False, None, f"ipfs command not found: {e}")
+            return results
+        except subprocess.TimeoutExpired:
+            for cid, _ in tokens:
+                if cid not in results:
+                    results[cid] = (False, None, "ipfs add timed out")
+            return results
+        
+        out = proc.stdout.decode("utf-8", errors="replace").strip()
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        
+        if proc.returncode != 0:
+            # Bulk operation failed - mark all as failed
+            error_msg = f"ipfs bulk add failed: {err or out}"
+            for cid, _ in tokens:
+                if cid not in results:
+                    results[cid] = (False, None, error_msg)
+            return results
+        
+        # Parse output: "added <cid> <filename>"
+        # Map filename (which is the expected CID) to returned CID
+        cid_map = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == "added":
+                returned_cid = parts[1]
+                filename = parts[2]
+                # Extract CID from filename (filename is the expected CID)
+                expected_cid = os.path.basename(filename)
+                cid_map[expected_cid] = returned_cid
+        
+        # Match results
+        for cid, _ in tokens:
+            if cid in results:
+                continue  # Already marked as failed during file creation
+            
+            if cid in cid_map:
+                returned_cid = cid_map[cid]
+                if returned_cid == cid:
+                    results[cid] = (True, returned_cid, "")
+                else:
+                    results[cid] = (False, returned_cid, f"CID mismatch: expected {cid}, got {returned_cid}")
+            else:
+                results[cid] = (False, None, f"CID {cid} not found in ipfs add output")
+        
+    finally:
+        # Clean up temporary directory
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Failed to clean up temp directory {temp_dir}: {e}")
+    
+    return results
+
+
 def update_token_statuses(
     conn: sqlite3.Connection,
     table_name: str,
@@ -398,7 +520,7 @@ def process_batch(
     if total_results == 0:
         return len(not_found), 0, 0
     
-    # Prepare tokens for parallel processing
+    # Prepare tokens for bulk processing
     tokens_to_pin = []
     for cid, info in results.items():
         content = info.get("content")
@@ -415,58 +537,46 @@ def process_batch(
     if not tokens_to_pin:
         return len(not_found), 0, pin_failed
     
-    # Parallel IPFS pinning
-    progress_lock = threading.Lock()
-    processed_count = [0]  # Use list for thread-safe counter
+    # Use bulk IPFS add for efficiency (single command, no lock contention)
+    if logger:
+        logger.info(f"Bulk adding {len(tokens_to_pin)} tokens to IPFS in single operation")
     
-    def update_progress():
-        with progress_lock:
-            processed_count[0] += 1
-            count = processed_count[0]
-            elapsed = time.time() - batch_start_time
-            rate = count / elapsed if elapsed > 0 else 0
-            if total_batches > 0 and total_results > 0:
-                overall_progress = ((batch_num - 1) / total_batches + (count / total_results) / total_batches) * 100
-                print(f"  [{batch_num}/{total_batches}] Pinning: {count}/{total_results} ({rate:.1f}/s) | Overall: {overall_progress:.1f}%", end="\r")
-            elif total_results > 0:
-                print(f"  Pinning: {count}/{total_results} ({rate:.1f}/s)", end="\r")
+    # Show progress
+    if total_batches > 0 and total_results > 0:
+        overall_progress = ((batch_num - 1) / total_batches) * 100
+        print(f"  [{batch_num}/{total_batches}] Bulk pinning {len(tokens_to_pin)} tokens... | Overall: {overall_progress:.1f}%", end="\r")
+    else:
+        print(f"  Bulk pinning {len(tokens_to_pin)} tokens...", end="\r")
     
-    # Process tokens in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all pinning tasks
-        future_to_cid = {
-            executor.submit(pin_single_token, cid, content, ipfs_command, ipfs_path): cid
-            for cid, content in tokens_to_pin
-        }
-        
-        # Process completed tasks
-        for future in as_completed(future_to_cid):
-            cid = future_to_cid[future]
-            try:
-                cid_result, success, added_cid, error = future.result()
-                update_progress()
-                
-                if not success:
-                    msg = f"IPFS add failed for {cid_result}: {error} (status unchanged)"
-                    if logger:
-                        logger.warning(msg)
-                    if verbose:
-                        print(f"\n  {msg}")
-                    pin_failed += 1
-                else:
-                    pinned_ok += 1
-                    if logger:
-                        logger.debug(f"Pinned OK: {cid_result} (status unchanged)")
-            except Exception as e:
-                msg = f"Exception pinning {cid}: {e}"
-                if logger:
-                    logger.error(msg)
-                if verbose:
-                    print(f"\n  {msg}")
-                pin_failed += 1
+    # Run bulk add
+    bulk_results = run_ipfs_bulk_add(
+        tokens=tokens_to_pin,
+        ipfs_command=ipfs_command,
+        ipfs_path=ipfs_path,
+    )
     
-    # Clear progress line
-    print()  # New line after progress updates
+    # Process results
+    for cid, (success, added_cid, error) in bulk_results.items():
+        if not success:
+            msg = f"IPFS add failed for {cid}: {error} (status unchanged)"
+            if logger:
+                logger.warning(msg)
+            if verbose:
+                print(f"\n  {msg}")
+            pin_failed += 1
+        else:
+            pinned_ok += 1
+            if logger:
+                logger.debug(f"Pinned OK: {cid} (status unchanged)")
+    
+    # Clear progress line and show summary
+    elapsed = time.time() - batch_start_time
+    rate = len(tokens_to_pin) / elapsed if elapsed > 0 else 0
+    if total_batches > 0 and total_results > 0:
+        overall_progress = (batch_num / total_batches) * 100
+        print(f"  [{batch_num}/{total_batches}] Bulk pinned: {pinned_ok} success, {pin_failed} failed ({rate:.1f}/s) | Overall: {overall_progress:.1f}%")
+    else:
+        print(f"  Bulk pinned: {pinned_ok} success, {pin_failed} failed ({rate:.1f}/s)")
 
     return len(not_found), pinned_ok, pin_failed
 
